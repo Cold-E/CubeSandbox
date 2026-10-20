@@ -208,14 +208,40 @@ var egressCreatePushRetryDelays = []time.Duration{
 // deleteEgressForState fires DELETE /admin/v1/policies/<ip> at release/cleanup
 // time. A failed delete leaves the TAP/state in Cleaning so the maintenance loop
 // retries before the sandbox IP can be reused by a different sandbox.
+//
+// As a bare-metal / non-K8s concession, a connection-refused on the admin
+// port (CubeEgress sidecar not running) is downgraded to a warning so
+// sandbox/template deletion is not stalled forever by a dead loopback
+// port. The create/push path is intentionally NOT given this behavior:
+// a sidecar restart in the K8s chart momentarily refuses the admin
+// port, and silently dropping a PUSH would leak the previous sandbox's
+// secrets in CubeEgress. Only the release/cleanup path can safely
+// proceed without the sidecar, because there is nothing left to protect
+// once the sandbox IP is being released.
 func (s *NetworkController) deleteEgressForState(ctx context.Context, sandboxID, sandboxIP string) error {
 	if s.cubeEgressAdapter == nil || !s.cubeEgressAdapter.Configured() {
 		return nil
 	}
 	if err := s.cubeEgressAdapter.DeletePolicy(ctx, sandboxIP); err != nil && !errors.Is(err, cubeegress.ErrNotConfigured) {
+		if cubeegress.IsConnectionRefused(err) {
+			CubeLog.WithContext(ctx).Warnf(
+				"CubeEgress admin endpoint refused connection for sandbox %s ip %s; "+
+					"sidecar likely absent (bare-metal). Downgrading cleanup to no-op: %v",
+				sandboxID, sandboxIP, err,
+			)
+			return nil
+		}
 		return fmt.Errorf("delete CubeEgress policy for sandbox %s ip %s: %w", sandboxID, sandboxIP, err)
 	}
 	if err := s.cubeEgressAdapter.VerifyPolicyAbsent(ctx, sandboxIP); err != nil && !errors.Is(err, cubeegress.ErrNotConfigured) {
+		if cubeegress.IsConnectionRefused(err) {
+			CubeLog.WithContext(ctx).Warnf(
+				"CubeEgress admin endpoint refused connection (verify) for sandbox %s ip %s; "+
+					"sidecar likely absent (bare-metal). Downgrading verify to no-op: %v",
+				sandboxID, sandboxIP, err,
+			)
+			return nil
+		}
 		return fmt.Errorf("verify CubeEgress policy absent for sandbox %s ip %s: %w", sandboxID, sandboxIP, err)
 	}
 	return nil

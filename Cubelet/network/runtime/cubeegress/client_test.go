@@ -26,15 +26,11 @@ func TestConfiguredEmptyAdminURL(t *testing.T) {
 	}
 }
 
-// TestConnectionRefusedMarksUnreachable is the core bare-metal
-// graceful-degrade test: a configured client whose admin endpoint is
-// not listening (connection refused) must mark itself unreachable, so
-// subsequent Configured() returns false and callers no-op instead of
-// retrying against a dead port forever.
-func TestConnectionRefusedMarksUnreachable(t *testing.T) {
-	// Pick a port that is effectively guaranteed to be closed: bind
-	// a listener, capture its address, close it, then dial it. On a
-	// quiet loopback this yields ECONNREFUSED deterministically.
+// TestConnectionRefusedReturnsError confirms the client surfaces the
+// refusal error (the adapter, not the client, decides whether to
+// downgrade it). Configured() stays true so the create/push path keeps
+// retrying through a sidecar restart in the K8s chart.
+func TestConnectionRefusedReturnsError(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Skipf("cannot allocate loopback port: %v", err)
@@ -47,38 +43,39 @@ func TestConnectionRefusedMarksUnreachable(t *testing.T) {
 		t.Fatalf("Configured() = false before first call, want true")
 	}
 
-	// First DeletePolicy hits connection-refused and marks unreachable.
 	err = c.DeletePolicy(context.Background(), "10.0.0.1")
 	if err == nil {
 		t.Fatalf("DeletePolicy returned nil on connection refused, want error")
 	}
-	if !isConnectionRefused(err) {
+	if !IsConnectionRefused(err) {
 		t.Fatalf("DeletePolicy err = %v, want a connection-refused error", err)
 	}
-	if c.Configured() {
-		t.Fatalf("Configured() = true after connection refused, want false (client should self-disable)")
-	}
-
-	// Subsequent calls must short-circuit via Configured() and return
-	// ErrNotConfigured without touching the network again.
-	if err := c.DeletePolicy(context.Background(), "10.0.0.1"); !errors.Is(err, ErrNotConfigured) {
-		t.Fatalf("second DeletePolicy err = %v, want ErrNotConfigured after self-disable", err)
+	// Crucially, the client does NOT self-disable: a K8s sidecar restart
+	// also refuses the port momentarily, and the create path must keep
+	// retrying through it.
+	if !c.Configured() {
+		t.Fatalf("Configured() = false after connection refused, want true (client must NOT self-disable)")
 	}
 }
 
-// TestServer5xxDoesNotMarkUnreachable ensures a live sidecar returning
-// 5xx is NOT treated as absent — that path stays retryable so a
-// temporary OpenResty hiccup doesn't silently drop egress policy.
-func TestServer5xxDoesNotMarkUnreachable(t *testing.T) {
+// TestServer5xxReturnsError ensures a live sidecar returning 5xx keeps
+// the error retryable (neither downgraded nor self-disabled).
+func TestServer5xxReturnsError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
 	}))
 	defer srv.Close()
 
 	c := New(srv.URL, time.Second)
-	_ = c.DeletePolicy(context.Background(), "10.0.0.1")
+	err := c.DeletePolicy(context.Background(), "10.0.0.1")
+	if err == nil {
+		t.Fatalf("DeletePolicy returned nil on 5xx, want error")
+	}
+	if IsConnectionRefused(err) {
+		t.Fatalf("5xx classified as connection-refused, want false")
+	}
 	if !c.Configured() {
-		t.Fatalf("Configured() = false after 5xx, want true (transient errors must not self-disable)")
+		t.Fatalf("Configured() = false after 5xx, want true")
 	}
 }
 
@@ -100,25 +97,29 @@ func TestServer2xxKeepsConfigured(t *testing.T) {
 }
 
 // TestContextTimeoutDoesNotMarkUnreachable: a deadline exceeded while
-// the sidecar may be slow (but present) must not be treated as absence.
-func TestContextTimeoutDoesNotMarkUnreachable(t *testing.T) {
+// the sidecar may be slow (but present) must not be classified as a
+// refusal — that path stays retryable.
+func TestContextTimeoutNotClassifiedAsRefused(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Sleep past the client timeout; the context will cancel.
 		time.Sleep(200 * time.Millisecond)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
 
 	c := New(srv.URL, 50*time.Millisecond)
-	_ = c.DeletePolicy(context.Background(), "10.0.0.1")
-	if !c.Configured() {
-		t.Fatalf("Configured() = false after timeout, want true (timeout must not self-disable)")
+	err := c.DeletePolicy(context.Background(), "10.0.0.1")
+	if err == nil {
+		t.Fatalf("DeletePolicy returned nil on timeout, want error")
+	}
+	if IsConnectionRefused(err) {
+		t.Fatalf("timeout classified as connection-refused, want false")
 	}
 }
 
 // TestIsConnectionRefusedClassifier sanity-checks the classifier against
 // a real ECONNREFUSED dial error so the string fallback never silently
-// drifts.
+// drifts across platforms (Linux "connection refused" / Windows
+// "actively refused it").
 func TestIsConnectionRefusedClassifier(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -131,7 +132,13 @@ func TestIsConnectionRefusedClassifier(t *testing.T) {
 	if dialErr == nil {
 		t.Skip("dial to closed port succeeded; cannot test classifier")
 	}
-	if !isConnectionRefused(dialErr) {
-		t.Fatalf("isConnectionRefused(%v) = false, want true", dialErr)
+	if !IsConnectionRefused(dialErr) {
+		t.Fatalf("IsConnectionRefused(%v) = false, want true", dialErr)
+	}
+	if IsConnectionRefused(nil) {
+		t.Fatalf("IsConnectionRefused(nil) = true, want false")
+	}
+	if IsConnectionRefused(errors.New("some other error")) {
+		t.Fatalf("IsConnectionRefused(other) = true, want false")
 	}
 }

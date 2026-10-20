@@ -127,3 +127,46 @@ func TestDeleteEgressForStateDeletesAndVerifies(t *testing.T) {
 		t.Fatalf("deleteCalls=%d verifyCalls=%d, want 1/1", adapter.deleteCalls, adapter.verifyCalls)
 	}
 }
+
+// TestDeleteEgressForStateDowngradesConnectionRefused covers the
+// bare-metal / non-K8s case: the CubeEgress sidecar is not running, so
+// DeletePolicy hits ECONNREFUSED. The release/cleanup path must
+// downgrade that to nil so sandbox/template deletion is not stalled
+// forever by a dead loopback port (the original "130593 cleanup context
+// deadline exceeded" symptom).
+func TestDeleteEgressForStateDowngradesConnectionRefused(t *testing.T) {
+	refused := errors.New("cubeegress: DELETE /admin/v1/policies/10.0.0.2: dial tcp 127.0.0.1:9091: connect: connection refused")
+	adapter := &fakeCubeEgressAdapter{configured: true, deleteErr: refused}
+	controller := &NetworkController{cubeEgressAdapter: adapter}
+
+	if err := controller.deleteEgressForState(context.Background(), "sandbox1", "10.0.0.2"); err != nil {
+		t.Fatalf("deleteEgressForState err = %v, want nil (connection refused must be downgraded for cleanup)", err)
+	}
+}
+
+// TestDeleteEgressForStateDowngradesVerifyConnectionRefused covers the
+// same bare-metal concession on the VerifyPolicyAbsent step.
+func TestDeleteEgressForStateDowngradesVerifyConnectionRefused(t *testing.T) {
+	refused := errors.New("cubeegress: GET /admin/v1/policies/10.0.0.2: dial tcp 127.0.0.1:9091: connect: connection refused")
+	adapter := &fakeCubeEgressAdapter{configured: true, verifyErr: refused}
+	controller := &NetworkController{cubeEgressAdapter: adapter}
+
+	if err := controller.deleteEgressForState(context.Background(), "sandbox1", "10.0.0.2"); err != nil {
+		t.Fatalf("deleteEgressForState err = %v, want nil (verify connection refused must be downgraded)", err)
+	}
+}
+
+// TestDeleteEgressForStateStillErrorsOnTransient confirms a non-refused
+// transient error (5xx, timeout) is NOT downgraded — the TAP stays in
+// Cleaning and the maintenance loop retries, which is the existing
+// safety guarantee against IP reuse while CubeEgress still holds policy.
+func TestDeleteEgressForStateStillErrorsOnTransient(t *testing.T) {
+	transient := errors.New("cubeegress: DELETE /admin/v1/policies/10.0.0.2: 502 Bad Gateway")
+	adapter := &fakeCubeEgressAdapter{configured: true, deleteErr: transient}
+	controller := &NetworkController{cubeEgressAdapter: adapter}
+
+	err := controller.deleteEgressForState(context.Background(), "sandbox1", "10.0.0.2")
+	if err == nil {
+		t.Fatalf("deleteEgressForState err = nil on transient 5xx, want error (must NOT downgrade non-refused failures)")
+	}
+}
