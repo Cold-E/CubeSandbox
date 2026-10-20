@@ -113,12 +113,21 @@ func (c *Client) IsLoopback() bool {
 	if err != nil {
 		return false
 	}
-	host := u.Hostname()
-	switch host {
-	case "localhost", "::1":
+	// u.Hostname() preserves the raw host verbatim — no lowercasing, and
+	// a trailing dot (FQDN form like "localhost.") is kept. DNS is
+	// case-insensitive and ignores the trailing dot, so a config of
+	// http://LOCALHOST:9091 or http://localhost.:9091 still dials the
+	// sidecar. Without normalization the named-form check below would
+	// miss those, the release-path downgrade would never fire, and the
+	// bare-metal stall this PR fixes would silently reappear. Match the
+	// DNS semantics, not the raw bytes.
+	host := strings.TrimSuffix(u.Hostname(), ".")
+	if strings.EqualFold(host, "localhost") || host == "::1" {
 		return true
 	}
-	// 127.0.0.0/8 — any 127.x.x.x is loopback.
+	// 127.0.0.0/8 — any 127.x.x.x is loopback. net.ParseIP also accepts
+	// the ::1 literal, so the named check above is the fast path for the
+	// string forms; this handles the numeric forms.
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
 }

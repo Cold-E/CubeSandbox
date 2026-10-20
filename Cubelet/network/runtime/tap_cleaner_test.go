@@ -76,6 +76,87 @@ func TestCleanupTapForReuseKeepsCleaningOnCubeEgressVerifyFailure(t *testing.T) 
 	}
 }
 
+// TestCleanupTapForReuseDowngradesRefusedCubeEgress pins the release-path
+// wiring end-to-end. cleanupEgressForReuse (tap_cleaner.go) must call
+// deleteEgressForState with allowDowngrade=true so a connection-refused on
+// the CubeEgress admin port (bare-metal, no sidecar) is downgraded and the
+// TAP returns to Ready instead of stalling in Cleaning forever. The adapter
+// tests exercise deleteEgressForState directly with an explicit
+// allowDowngrade argument, so flipping the `true` literal at the call site
+// back to `false` would silently reintroduce the reported 130593 stall and
+// the whole suite would still pass; this case fails in that scenario because
+// the refused delete would no longer be downgraded.
+//
+// loopback is set on the fake to match the real http://127.0.0.1:9091
+// deployment shape, so the loopback gate (the second condition in
+// `allowDowngrade && IsLoopback() && IsConnectionRefused`) does not
+// short-circuit before the classifier runs.
+func TestCleanupTapForReuseDowngradesRefusedCubeEgress(t *testing.T) {
+	controller, state := newCleanerTestState(t, nil)
+	egress := controller.cubeEgressAdapter.(*fakeCubeEgressAdapter)
+	egress.loopback = true
+	egress.deleteErr = refusedEgressError("DELETE", "/admin/v1/policies/"+state.SandboxIP)
+
+	if err := controller.cleanupTapForReuse(context.Background(), state, StateFileDeleting); err != nil {
+		t.Fatalf("cleanupTapForReuse err = %v, want nil (refused CubeEgress must be downgraded on release path)", err)
+	}
+	if controller.store.Exists(state.SandboxID, StateFileDeleting) {
+		t.Fatal("deleting state still exists after downgraded cleanup success")
+	}
+	poolState, owner, ok := controller.tapPool.StateByName(state.TapName)
+	if !ok || poolState != TapPoolReady || owner != "" {
+		t.Fatalf("tap state=%s owner=%s ok=%v, want Ready without owner after refused downgrade", poolState, owner, ok)
+	}
+	if egress.deleteCalls != 1 {
+		t.Fatalf("deleteCalls = %d, want 1 (refused delete must be attempted, then downgraded)", egress.deleteCalls)
+	}
+}
+
+// TestCleanupTapForReuseDowngradesRefusedCubeEgressVerify is the
+// VerifyPolicyAbsent counterpart: a refused verify (after a successful
+// delete) must also be downgraded so cleanup completes.
+func TestCleanupTapForReuseDowngradesRefusedCubeEgressVerify(t *testing.T) {
+	controller, state := newCleanerTestState(t, nil)
+	egress := controller.cubeEgressAdapter.(*fakeCubeEgressAdapter)
+	egress.loopback = true
+	egress.verifyErr = refusedEgressError("GET", "/admin/v1/policies/"+state.SandboxIP)
+
+	if err := controller.cleanupTapForReuse(context.Background(), state, StateFileDeleting); err != nil {
+		t.Fatalf("cleanupTapForReuse err = %v, want nil (refused verify must be downgraded on release path)", err)
+	}
+	if controller.store.Exists(state.SandboxID, StateFileDeleting) {
+		t.Fatal("deleting state still exists after downgraded verify cleanup success")
+	}
+	poolState, owner, ok := controller.tapPool.StateByName(state.TapName)
+	if !ok || poolState != TapPoolReady || owner != "" {
+		t.Fatalf("tap state=%s owner=%s ok=%v, want Ready without owner after refused verify downgrade", poolState, owner, ok)
+	}
+}
+
+// TestCleanupTapForReuseKeepsCleaningOnRefusedNonLoopback pins the loopback
+// gate from the call site: when the admin URL is non-loopback, a refused
+// delete must NOT be downgraded even on the release path, because the
+// sidecar may live elsewhere and still hold the previous sandbox's policy.
+// Flipping the loopback gate off (or the call-site true to false) would
+// make this regression pass when it must fail.
+func TestCleanupTapForReuseKeepsCleaningOnRefusedNonLoopback(t *testing.T) {
+	controller, state := newCleanerTestState(t, nil)
+	egress := controller.cubeEgressAdapter.(*fakeCubeEgressAdapter)
+	egress.loopback = false
+	egress.deleteErr = refusedEgressError("DELETE", "/admin/v1/policies/"+state.SandboxIP)
+
+	if err := controller.cleanupTapForReuse(context.Background(), state, StateFileDeleting); err == nil {
+		t.Fatal("cleanupTapForReuse err = nil on non-loopback refused, want error (loopback gate must block downgrade at call site)")
+	}
+	if !controller.store.Exists(state.SandboxID, StateFileDeleting) {
+		t.Fatal("deleting state removed despite non-loopback refused delete (IP-reuse barrier breached)")
+	}
+	poolState, owner, ok := controller.tapPool.StateByName(state.TapName)
+	if !ok || poolState != TapPoolCleaning || owner != state.SandboxID {
+		t.Fatalf("tap state=%s owner=%s ok=%v, want Cleaning owned by sandbox", poolState, owner, ok)
+	}
+}
+
 func TestCleanupTapForReuseKeepsCleaningWhenTapFDStillBusy(t *testing.T) {
 	controller, state := newCleanerTestState(t, nil)
 	cubevsAdapter := controller.cubevsAdapter.(*fakeCubeVSAdapter)
