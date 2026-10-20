@@ -152,10 +152,21 @@ func TestIsConnectionRefusedClassifier(t *testing.T) {
 // downgraded to a cleanup no-op — that would silently drop the
 // IP-reuse barrier exactly when CubeEgress is up and still holds the
 // policy.
+//
+// The body is deliberately lowercase "connection refused", matching the
+// classifier's string fallback (client.go: "connection refused" /
+// "actively refused it"). A regression to strings.Contains(err.Error(),
+// "connection refused") — scanning the whole composed message instead
+// of the inner transport error — would hit this substring and FAIL this
+// test. A capitalized body (nginx's default "Connection refused") would
+// pass both the correct classifier AND the regressed one, so it guards
+// nothing.
 func TestIsConnectionRefusedDoesNotMatchResponseBody(t *testing.T) {
 	// Simulate the exact shape do() produces for a 502 whose body
-	// contains a refused-connection log line.
-	body := `connect() failed (111: Connection refused) while connecting to upstream`
+	// contains a lowercase refused-connection log line — the shape the
+	// classifier's string fallback would match if it ever inspected the
+	// composed message.
+	body := `dial tcp 127.0.0.1:9091: connect: connection refused while connecting to upstream`
 	statusErr := fmt.Errorf("cubeegress: DELETE /admin/v1/policies/10.0.0.1: 502 %s", body)
 	if IsConnectionRefused(statusErr) {
 		t.Fatalf("IsConnectionRefused matched a 502 response body containing 'connection refused'; " +

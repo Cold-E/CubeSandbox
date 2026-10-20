@@ -239,13 +239,36 @@ func TestDeleteEgressForStateKeepsRefusedStrictOnLiveUpdate(t *testing.T) {
 // transient error (5xx, timeout) is NOT downgraded even on the release
 // path — the TAP stays in Cleaning and the maintenance loop retries,
 // preserving the IP-reuse safety guarantee.
+//
+// loopback is set to true on purpose so the downgrade condition
+// (allowDowngrade && IsLoopback() && IsConnectionRefused) short-circuits
+// on IsConnectionRefused, not on IsLoopback. With loopback=false this
+// would pass even if the classifier were dropped and any error on a
+// loopback URL were downgraded — precisely the leak the gate exists to
+// prevent. Here a 5xx must be surfaced by IsConnectionRefused returning
+// false, not by the loopback gate.
 func TestDeleteEgressForStateStillErrorsOnTransient(t *testing.T) {
 	transient := errors.New("cubeegress: DELETE /admin/v1/policies/10.0.0.2: 502 Bad Gateway")
-	adapter := &fakeCubeEgressAdapter{configured: true, deleteErr: transient}
+	adapter := &fakeCubeEgressAdapter{configured: true, loopback: true, deleteErr: transient}
 	controller := &NetworkController{cubeEgressAdapter: adapter}
 
 	err := controller.deleteEgressForState(context.Background(), "sandbox1", "10.0.0.2", true)
 	if err == nil {
 		t.Fatalf("deleteEgressForState err = nil on transient 5xx, want error (must NOT downgrade non-refused failures)")
+	}
+}
+
+// TestDeleteEgressForStateStillErrorsOnTransientVerify pins the same
+// guarantee on the VerifyPolicyAbsent step: a transient verify error must
+// not be downgraded even when the admin URL is loopback and the release
+// caller passed allowDowngrade=true.
+func TestDeleteEgressForStateStillErrorsOnTransientVerify(t *testing.T) {
+	transient := errors.New("cubeegress: GET /admin/v1/policies/10.0.0.2: 502 Bad Gateway")
+	adapter := &fakeCubeEgressAdapter{configured: true, loopback: true, verifyErr: transient}
+	controller := &NetworkController{cubeEgressAdapter: adapter}
+
+	err := controller.deleteEgressForState(context.Background(), "sandbox1", "10.0.0.2", true)
+	if err == nil {
+		t.Fatalf("deleteEgressForState err = nil on transient verify 5xx, want error (must NOT downgrade non-refused failures)")
 	}
 }
