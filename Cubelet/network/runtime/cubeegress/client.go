@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -63,10 +65,26 @@ func IsNotFound(err error) bool {
 // shared across sandboxes — egress-policy mutations are infrequent
 // (one per sandbox lifetime) and the cost of a fresh connection is
 // noise next to tap allocation.
+//
+// Bare-metal reachability: when the admin endpoint is configured but
+// the CubeEgress sidecar is absent (typical bare-metal / non-K8s
+// deployment), the first connection fails with a connection-refused
+// error. Rather than block sandbox cleanup indefinitely on that, the
+// client marks itself unreachable after the first connection-refused
+// and Configured() starts returning false so callers no-op silently —
+// mirroring the explicit empty-adminURL dev mode. A non-refused error
+// (5xx, timeout, context cancel) is NOT treated as absence: those may
+// be transient and the existing retry semantics still apply.
 type Client struct {
 	adminURL string
 	timeout  time.Duration
 	httpc    *http.Client
+	// unreachable is set when the admin endpoint refused a connection,
+	// indicating the CubeEgress sidecar is not running. Once set it
+	// stays set for the lifetime of this Client (one per Cubelet
+	// process); a sidecar that starts later needs a Cubelet restart,
+	// which is the same requirement as any config change.
+	unreachable atomic.Bool
 }
 
 // New returns a Client configured to talk to adminURL with the given
@@ -88,11 +106,19 @@ func New(adminURL string, timeout time.Duration) *Client {
 	}
 }
 
-// Configured reports whether the client has an admin URL. Use it before
+// Configured reports whether the client has an admin URL and the
+// endpoint has not been marked unreachable. Use it before
 // PutPolicy/DeletePolicy when the caller wants to no-op silently rather
 // than receive ErrNotConfigured.
+//
+// Configured returns false in two cases: empty adminURL (explicit dev
+// mode), or a previously-configured endpoint that refused a connection
+// (detected CubeEgress sidecar absence, see Client.unreachable).
 func (c *Client) Configured() bool {
-	return c != nil && c.adminURL != ""
+	if c == nil || c.adminURL == "" {
+		return false
+	}
+	return !c.unreachable.Load()
 }
 
 // PutPolicy renders in into the wire shape and uploads it to the
@@ -180,6 +206,16 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte) error
 	}
 	resp, err := c.httpc.Do(req)
 	if err != nil {
+		// A connection-refused on the loopback admin port means the
+		// CubeEgress sidecar is not running. Mark the client
+		// unreachable so future calls no-op via Configured() instead
+		// of retrying forever against a port nothing will ever listen
+		// on. Bare-metal deployments without the sidecar hit this on
+		// the first egress cleanup and would otherwise stall sandbox
+		// deletion with "context deadline exceeded".
+		if isConnectionRefused(err) {
+			c.unreachable.Store(true)
+		}
 		return fmt.Errorf("cubeegress: %s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
@@ -217,4 +253,24 @@ func validateSandboxIP(s string) error {
 		return fmt.Errorf("cubeegress: sandbox_ip not URL-clean: %q", s)
 	}
 	return nil
+}
+
+// isConnectionRefused reports whether err is a connection-refused error
+// (ECONNREFUSED) from the underlying dialer. We only treat a definitive
+// refusal as "sidecar absent"; timeouts, DNS, and other transient errors
+// stay retryable. We check the syscall error via errors.Is against
+// syscall.ECONNREFUSED and fall back to a string match that covers both
+// Linux ("connection refused") and Windows ("actively refused it")
+// phrasings, since wrapped url.Error from net/http does not always
+// unwrap to syscall.Errno across platforms.
+func isConnectionRefused(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "actively refused it")
 }
