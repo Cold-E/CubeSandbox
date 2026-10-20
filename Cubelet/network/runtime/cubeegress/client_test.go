@@ -168,3 +168,42 @@ func TestIsConnectionRefusedDoesNotMatchResponseBody(t *testing.T) {
 		t.Fatalf("IsConnectionRefused matched a PermanentError body; the classifier must not inspect response bodies")
 	}
 }
+
+// TestIsLoopbackClassification covers the loopback gate the release-path
+// downgrade is scoped to. A refused loopback dial proves the colocated
+// sidecar is gone, so the IP may be reused; a refused non-loopback dial
+// (proxy/LB/remote admin listener) does NOT prove that — the sidecar may
+// be alive elsewhere and still hold the previous sandbox's policy — so
+// IsLoopback must return false there to keep the downgrade from firing.
+func TestIsLoopbackClassification(t *testing.T) {
+	cases := []struct {
+		name     string
+		adminURL string
+		want     bool
+	}{
+		{"ipv4 loopback", "http://127.0.0.1:9091", true},
+		{"ipv4 loopback any octet", "http://127.3.2.1:9091", true},
+		{"localhost", "http://localhost:9091", true},
+		{"ipv6 loopback", "http://[::1]:9091", true},
+		{"non-loopback private", "http://10.0.0.49:9091", false},
+		{"non-loopback public", "http://203.0.113.7:9091", false},
+		{"hostname", "http://cubeegress.svc:9091", false},
+		{"empty", "", false},
+		{"garbage", "://not a url", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := New(tc.adminURL, 0)
+			if got := c.IsLoopback(); got != tc.want {
+				t.Fatalf("IsLoopback(%q) = %v, want %v", tc.adminURL, got, tc.want)
+			}
+		})
+	}
+	// A nil client must report false, not panic — the adapter call site
+	// guards nil itself, but IsLoopback is defensive in case a future
+	// caller forgets.
+	var nilClient *Client
+	if nilClient.IsLoopback() {
+		t.Fatalf("nilClient.IsLoopback() = true, want false")
+	}
+}

@@ -19,6 +19,14 @@ import (
 // deterministic failures in unit tests without spinning up an httptest server.
 type CubeEgressAdapter interface {
 	Configured() bool
+	// IsLoopback reports whether the admin URL points at a loopback
+	// address. The release-path connection-refused downgrade is gated on
+	// this: only a refused loopback dial proves the colocated sidecar is
+	// gone, so only there may the IP be reused without deleting the
+	// policy. A non-loopback admin URL (proxy/LB/remote listener) may
+	// refuse while the sidecar lives elsewhere and still holds the
+	// previous sandbox's policy, so the downgrade must not fire.
+	IsLoopback() bool
 	PutPolicy(ctx context.Context, sandboxIP string, in *cubeegress.PolicyInput) error
 	DeletePolicy(ctx context.Context, sandboxIP string) error
 	VerifyPolicyAbsent(ctx context.Context, sandboxIP string) error
@@ -213,22 +221,27 @@ var egressCreatePushRetryDelays = []time.Duration{
 // time. A failed delete leaves the TAP/state in Cleaning so the maintenance loop
 // retries before the sandbox IP can be reused by a different sandbox.
 //
-// allowDowngrade scopes the bare-metal / non-K8s concession: when true, a
-// connection-refused on the admin port (CubeEgress sidecar not running) is
-// downgraded to a warning + nil so cleanup is not stalled by a dead loopback
-// port. Only the release/reuse caller (cleanupEgressForReuse) passes true —
-// the sandbox is gone, there is nothing left to protect. The live policy-update
-// caller (syncEgressPolicy removing the last L7 rule) passes false: the sandbox
-// is still alive and a dropped delete would leak the previous policy/secrets in
-// CubeEgress, defeating the IP-reuse safety barrier that cleanupEgressForReuse
-// (tap_cleaner.go) exists to enforce. Non-refused transient failures (5xx,
-// timeout) always stay retryable regardless of allowDowngrade.
+// allowDowngrade scopes the bare-metal / non-K8s concession: when true AND the
+// admin URL is loopback, a connection-refused on the admin port (CubeEgress
+// sidecar not running) is downgraded to a warning + nil so cleanup is not
+// stalled by a dead loopback port. Only the release/reuse caller
+// (cleanupEgressForReuse) passes true — the sandbox is gone, there is nothing
+// left to protect. The live policy-update caller (syncEgressPolicy removing
+// the last L7 rule) passes false: the sandbox is still alive and a dropped
+// delete would leak the previous policy/secrets in CubeEgress, defeating the
+// IP-reuse safety barrier that cleanupEgressForReuse (tap_cleaner.go) exists
+// to enforce. The loopback gate is mandatory even on the release path: a
+// non-loopback admin URL (proxy/LB/remote listener) may refuse while the
+// sidecar lives elsewhere and still holds the previous sandbox's policy, so
+// downgrading there could hand the IP to a new sandbox with the old policy
+// still installed. Non-refused transient failures (5xx, timeout) always stay
+// retryable regardless of allowDowngrade.
 func (s *NetworkController) deleteEgressForState(ctx context.Context, sandboxID, sandboxIP string, allowDowngrade bool) error {
 	if s.cubeEgressAdapter == nil || !s.cubeEgressAdapter.Configured() {
 		return nil
 	}
 	if err := s.cubeEgressAdapter.DeletePolicy(ctx, sandboxIP); err != nil && !errors.Is(err, cubeegress.ErrNotConfigured) {
-		if allowDowngrade && cubeegress.IsConnectionRefused(err) {
+		if allowDowngrade && s.cubeEgressAdapter.IsLoopback() && cubeegress.IsConnectionRefused(err) {
 			CubeLog.WithContext(ctx).Warnf(
 				"CubeEgress admin endpoint refused connection for sandbox %s ip %s; "+
 					"sidecar likely absent (bare-metal). Downgrading release cleanup to no-op: %v",
@@ -239,7 +252,7 @@ func (s *NetworkController) deleteEgressForState(ctx context.Context, sandboxID,
 		return fmt.Errorf("delete CubeEgress policy for sandbox %s ip %s: %w", sandboxID, sandboxIP, err)
 	}
 	if err := s.cubeEgressAdapter.VerifyPolicyAbsent(ctx, sandboxIP); err != nil && !errors.Is(err, cubeegress.ErrNotConfigured) {
-		if allowDowngrade && cubeegress.IsConnectionRefused(err) {
+		if allowDowngrade && s.cubeEgressAdapter.IsLoopback() && cubeegress.IsConnectionRefused(err) {
 			CubeLog.WithContext(ctx).Warnf(
 				"CubeEgress admin endpoint refused connection (verify) for sandbox %s ip %s; "+
 					"sidecar likely absent (bare-metal). Downgrading release cleanup verify to no-op: %v",

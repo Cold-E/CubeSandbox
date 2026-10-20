@@ -97,6 +97,32 @@ func (c *Client) Configured() bool {
 	return c != nil && c.adminURL != ""
 }
 
+// IsLoopback reports whether the admin URL points at a loopback address
+// (127.0.0.0/8, ::1, or "localhost"). The release-path connection-refused
+// downgrade is gated on this: a refused loopback dial is strong evidence
+// the colocated sidecar is absent and its in-memory policy store is gone,
+// so the IP can be safely reused. A refusal on a non-loopback URL
+// (proxy/LB/remote admin listener) does NOT prove the policy store is
+// gone — the sidecar may be alive elsewhere and still hold the previous
+// sandbox's policy/secrets — so the downgrade must not fire there.
+func (c *Client) IsLoopback() bool {
+	if c == nil || c.adminURL == "" {
+		return false
+	}
+	u, err := url.Parse(c.adminURL)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	switch host {
+	case "localhost", "::1":
+		return true
+	}
+	// 127.0.0.0/8 — any 127.x.x.x is loopback.
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // PutPolicy renders in into the wire shape and uploads it to the
 // admin API at PUT /admin/v1/policies/<sandboxIP>. Returns nil on
 // 200 OK, a *PermanentError on 4xx, or a generic error on transport
