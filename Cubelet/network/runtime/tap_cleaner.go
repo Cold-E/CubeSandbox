@@ -323,7 +323,10 @@ func (s *NetworkController) cleanupEgressForReuse(ctx context.Context, state *pe
 	if !unknownPolicyState && toEgressInput(state.CubeNetworkConfig) == nil {
 		return nil
 	}
-	return s.deleteEgressForState(ctx, state.SandboxID, state.SandboxIP)
+	// Release/reuse path: the sandbox is gone, so a connection-refused
+	// (bare-metal, no sidecar) can safely downgrade to a no-op instead of
+	// stalling cleanup forever on a dead loopback port.
+	return s.deleteEgressForState(ctx, state.SandboxID, state.SandboxIP, true)
 }
 
 // startMaintenanceLoop periodically retries each durable cleanup exactly once.

@@ -3,6 +3,10 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
+	"net/url"
+	"syscall"
 	"testing"
 	"time"
 
@@ -120,7 +124,7 @@ func TestDeleteEgressForStateDeletesAndVerifies(t *testing.T) {
 	adapter := &fakeCubeEgressAdapter{configured: true}
 	controller := &NetworkController{cubeEgressAdapter: adapter}
 
-	if err := controller.deleteEgressForState(context.Background(), "sandbox1", "10.0.0.2"); err != nil {
+	if err := controller.deleteEgressForState(context.Background(), "sandbox1", "10.0.0.2", true); err != nil {
 		t.Fatal(err)
 	}
 	if adapter.deleteCalls != 1 || adapter.verifyCalls != 1 {
@@ -128,44 +132,75 @@ func TestDeleteEgressForStateDeletesAndVerifies(t *testing.T) {
 	}
 }
 
-// TestDeleteEgressForStateDowngradesConnectionRefused covers the
-// bare-metal / non-K8s case: the CubeEgress sidecar is not running, so
-// DeletePolicy hits ECONNREFUSED. The release/cleanup path must
-// downgrade that to nil so sandbox/template deletion is not stalled
-// forever by a dead loopback port (the original "130593 cleanup context
-// deadline exceeded" symptom).
+// refusedEgressError builds the exact error shape the real client returns on a
+// connection-refused: a *url.Error wrapping a *net.OpError wrapping ECONNREFUSED.
+// IsConnectionRefused only inspects the inner transport error, never the
+// composed message, so the fixture must carry the unwrap chain — a plain
+// errors.New("... connection refused") would NOT match.
+func refusedEgressError(method, path string) error {
+	return fmt.Errorf("cubeegress: %s %s: %w", method, path, &url.Error{
+		Op:  method,
+		URL: "http://127.0.0.1:9091" + path,
+		Err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED},
+	})
+}
+
+// TestDeleteEgressForStateDowngradesConnectionRefused covers the bare-metal /
+// non-K8s case on the release/cleanup path: the CubeEgress sidecar is not
+// running, so DeletePolicy hits ECONNREFUSED. The release caller passes
+// allowDowngrade=true and the cleanup proceeds with a warning instead of
+// stalling sandbox/template deletion forever.
 func TestDeleteEgressForStateDowngradesConnectionRefused(t *testing.T) {
-	refused := errors.New("cubeegress: DELETE /admin/v1/policies/10.0.0.2: dial tcp 127.0.0.1:9091: connect: connection refused")
+	refused := refusedEgressError("DELETE", "/admin/v1/policies/10.0.0.2")
 	adapter := &fakeCubeEgressAdapter{configured: true, deleteErr: refused}
 	controller := &NetworkController{cubeEgressAdapter: adapter}
 
-	if err := controller.deleteEgressForState(context.Background(), "sandbox1", "10.0.0.2"); err != nil {
-		t.Fatalf("deleteEgressForState err = %v, want nil (connection refused must be downgraded for cleanup)", err)
+	if err := controller.deleteEgressForState(context.Background(), "sandbox1", "10.0.0.2", true); err != nil {
+		t.Fatalf("deleteEgressForState err = %v, want nil (connection refused must be downgraded on release path)", err)
 	}
 }
 
-// TestDeleteEgressForStateDowngradesVerifyConnectionRefused covers the
-// same bare-metal concession on the VerifyPolicyAbsent step.
+// TestDeleteEgressForStateDowngradesVerifyConnectionRefused covers the same
+// bare-metal concession on the VerifyPolicyAbsent step.
 func TestDeleteEgressForStateDowngradesVerifyConnectionRefused(t *testing.T) {
-	refused := errors.New("cubeegress: GET /admin/v1/policies/10.0.0.2: dial tcp 127.0.0.1:9091: connect: connection refused")
+	refused := refusedEgressError("GET", "/admin/v1/policies/10.0.0.2")
 	adapter := &fakeCubeEgressAdapter{configured: true, verifyErr: refused}
 	controller := &NetworkController{cubeEgressAdapter: adapter}
 
-	if err := controller.deleteEgressForState(context.Background(), "sandbox1", "10.0.0.2"); err != nil {
-		t.Fatalf("deleteEgressForState err = %v, want nil (verify connection refused must be downgraded)", err)
+	if err := controller.deleteEgressForState(context.Background(), "sandbox1", "10.0.0.2", true); err != nil {
+		t.Fatalf("deleteEgressForState err = %v, want nil (verify connection refused must be downgraded on release path)", err)
+	}
+}
+
+// TestDeleteEgressForStateKeepsRefusedStrictOnLiveUpdate guards the live
+// policy-update path (syncEgressPolicy removing the last L7 rule from a
+// running sandbox): allowDowngrade=false means a refused delete is NOT
+// downgraded, so the previous policy/secrets are not leaked in CubeEgress
+// while the sandbox is still alive.
+func TestDeleteEgressForStateKeepsRefusedStrictOnLiveUpdate(t *testing.T) {
+	refused := refusedEgressError("DELETE", "/admin/v1/policies/10.0.0.2")
+	adapter := &fakeCubeEgressAdapter{configured: true, deleteErr: refused}
+	controller := &NetworkController{cubeEgressAdapter: adapter}
+
+	err := controller.deleteEgressForState(context.Background(), "sandbox1", "10.0.0.2", false)
+	if err == nil {
+		t.Fatalf("deleteEgressForState err = nil on refused with allowDowngrade=false, want error (live update must stay strict)")
+	}
+	if !cubeegress.IsConnectionRefused(err) {
+		t.Fatalf("err = %v, want a connection-refused error to surface to the caller", err)
 	}
 }
 
 // TestDeleteEgressForStateStillErrorsOnTransient confirms a non-refused
-// transient error (5xx, timeout) is NOT downgraded — the TAP stays in
-// Cleaning and the maintenance loop retries, which is the existing
-// safety guarantee against IP reuse while CubeEgress still holds policy.
+// transient error (5xx, timeout) is NOT downgraded even on the release
+// path — the TAP stays in Cleaning and the maintenance loop retries,
+// preserving the IP-reuse safety guarantee.
 func TestDeleteEgressForStateStillErrorsOnTransient(t *testing.T) {
 	transient := errors.New("cubeegress: DELETE /admin/v1/policies/10.0.0.2: 502 Bad Gateway")
 	adapter := &fakeCubeEgressAdapter{configured: true, deleteErr: transient}
 	controller := &NetworkController{cubeEgressAdapter: adapter}
 
-	err := controller.deleteEgressForState(context.Background(), "sandbox1", "10.0.0.2")
+	err := controller.deleteEgressForState(context.Background(), "sandbox1", "10.0.0.2", true)
 	if err == nil {
 		t.Fatalf("deleteEgressForState err = nil on transient 5xx, want error (must NOT downgrade non-refused failures)")
 	}

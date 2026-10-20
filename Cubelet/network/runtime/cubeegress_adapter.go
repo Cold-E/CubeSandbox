@@ -158,7 +158,11 @@ func (s *NetworkController) syncEgressPolicy(ctx context.Context, state *managed
 		return nil
 	}
 	if want == nil {
-		return s.deleteEgressForState(ctx, state.SandboxID, state.SandboxIP)
+		// Live sandbox policy update removing the last L7 rule: keep the
+		// delete strict. A dropped delete here leaks the previous policy
+		// in CubeEgress while the sandbox is still running, so we do NOT
+		// allow the bare-metal connection-refused downgrade.
+		return s.deleteEgressForState(ctx, state.SandboxID, state.SandboxIP, false)
 	}
 	return s.putEgressPolicyForCreate(ctx, state, want)
 }
@@ -209,24 +213,25 @@ var egressCreatePushRetryDelays = []time.Duration{
 // time. A failed delete leaves the TAP/state in Cleaning so the maintenance loop
 // retries before the sandbox IP can be reused by a different sandbox.
 //
-// As a bare-metal / non-K8s concession, a connection-refused on the admin
-// port (CubeEgress sidecar not running) is downgraded to a warning so
-// sandbox/template deletion is not stalled forever by a dead loopback
-// port. The create/push path is intentionally NOT given this behavior:
-// a sidecar restart in the K8s chart momentarily refuses the admin
-// port, and silently dropping a PUSH would leak the previous sandbox's
-// secrets in CubeEgress. Only the release/cleanup path can safely
-// proceed without the sidecar, because there is nothing left to protect
-// once the sandbox IP is being released.
-func (s *NetworkController) deleteEgressForState(ctx context.Context, sandboxID, sandboxIP string) error {
+// allowDowngrade scopes the bare-metal / non-K8s concession: when true, a
+// connection-refused on the admin port (CubeEgress sidecar not running) is
+// downgraded to a warning + nil so cleanup is not stalled by a dead loopback
+// port. Only the release/reuse caller (cleanupEgressForReuse) passes true —
+// the sandbox is gone, there is nothing left to protect. The live policy-update
+// caller (syncEgressPolicy removing the last L7 rule) passes false: the sandbox
+// is still alive and a dropped delete would leak the previous policy/secrets in
+// CubeEgress, defeating the IP-reuse safety barrier that cleanupEgressForReuse
+// (tap_cleaner.go) exists to enforce. Non-refused transient failures (5xx,
+// timeout) always stay retryable regardless of allowDowngrade.
+func (s *NetworkController) deleteEgressForState(ctx context.Context, sandboxID, sandboxIP string, allowDowngrade bool) error {
 	if s.cubeEgressAdapter == nil || !s.cubeEgressAdapter.Configured() {
 		return nil
 	}
 	if err := s.cubeEgressAdapter.DeletePolicy(ctx, sandboxIP); err != nil && !errors.Is(err, cubeegress.ErrNotConfigured) {
-		if cubeegress.IsConnectionRefused(err) {
+		if allowDowngrade && cubeegress.IsConnectionRefused(err) {
 			CubeLog.WithContext(ctx).Warnf(
 				"CubeEgress admin endpoint refused connection for sandbox %s ip %s; "+
-					"sidecar likely absent (bare-metal). Downgrading cleanup to no-op: %v",
+					"sidecar likely absent (bare-metal). Downgrading release cleanup to no-op: %v",
 				sandboxID, sandboxIP, err,
 			)
 			return nil
@@ -234,10 +239,10 @@ func (s *NetworkController) deleteEgressForState(ctx context.Context, sandboxID,
 		return fmt.Errorf("delete CubeEgress policy for sandbox %s ip %s: %w", sandboxID, sandboxIP, err)
 	}
 	if err := s.cubeEgressAdapter.VerifyPolicyAbsent(ctx, sandboxIP); err != nil && !errors.Is(err, cubeegress.ErrNotConfigured) {
-		if cubeegress.IsConnectionRefused(err) {
+		if allowDowngrade && cubeegress.IsConnectionRefused(err) {
 			CubeLog.WithContext(ctx).Warnf(
 				"CubeEgress admin endpoint refused connection (verify) for sandbox %s ip %s; "+
-					"sidecar likely absent (bare-metal). Downgrading verify to no-op: %v",
+					"sidecar likely absent (bare-metal). Downgrading release cleanup verify to no-op: %v",
 				sandboxID, sandboxIP, err,
 			)
 			return nil
