@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -229,19 +230,46 @@ func validateSandboxIP(s string) error {
 // NOT treat refusal as fatal — they keep retrying, since a sidecar
 // restart in the K8s chart momentarily refuses the admin port.
 //
-// We check the syscall error via errors.Is against syscall.ECONNREFUSED
-// and fall back to a string match that covers both Linux ("connection
-// refused") and Windows ("actively refused it") phrasings, since
-// wrapped url.Error from net/http does not always unwrap to
-// syscall.Errno across platforms.
+// Classification is scoped to the transport error, not the composed
+// message: do() builds status errors whose text includes the admin
+// response body, and a live sidecar returning a 502 whose body happens
+// to contain "connection refused" (e.g. an upstream proxy log line)
+// must NOT be downgraded. We unwrap to the inner *url.Error.Err and
+// check errors.Is against syscall.ECONNREFUSED, with a string fallback
+// only on that inner transport error (covers Windows where the unwrap
+// chain sometimes stops at *net.OpError without reaching errno).
 func IsConnectionRefused(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Fast path: the full chain unwraps to ECONNREFUSED on Linux.
 	if errors.Is(err, syscall.ECONNREFUSED) {
 		return true
 	}
-	msg := err.Error()
+	// Scope the string fallback to inner transport errors only.
+	// net/http wraps dial failures in *url.Error; net dial wraps in
+	// *net.OpError. In both cases the meaningful phrasing lives on the
+	// inner Err, never on the composed message that includes response
+	// bodies (a 502 body containing "connection refused" must NOT
+	// match). On Windows the unwrap chain sometimes stops at
+	// *net.OpError without reaching errno, so the string fallback is
+	// needed there.
+	var inner error
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		inner = urlErr.Err
+	} else {
+		var opErr *net.OpError
+		if errors.As(err, &opErr) && opErr.Err != nil {
+			inner = opErr.Err
+		} else {
+			return false
+		}
+	}
+	if errors.Is(inner, syscall.ECONNREFUSED) {
+		return true
+	}
+	msg := inner.Error()
 	return strings.Contains(msg, "connection refused") ||
 		strings.Contains(msg, "actively refused it")
 }

@@ -6,6 +6,7 @@ package cubeegress
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -140,5 +141,30 @@ func TestIsConnectionRefusedClassifier(t *testing.T) {
 	}
 	if IsConnectionRefused(errors.New("some other error")) {
 		t.Fatalf("IsConnectionRefused(other) = true, want false")
+	}
+}
+
+// TestIsConnectionRefusedDoesNotMatchResponseBody guards against the
+// regression where the classifier matches the composed error message:
+// do() builds status errors whose text includes the admin response
+// body, and a live sidecar returning a 502 whose body happens to contain
+// "connection refused" (e.g. an upstream proxy log line) must NOT be
+// downgraded to a cleanup no-op — that would silently drop the
+// IP-reuse barrier exactly when CubeEgress is up and still holds the
+// policy.
+func TestIsConnectionRefusedDoesNotMatchResponseBody(t *testing.T) {
+	// Simulate the exact shape do() produces for a 502 whose body
+	// contains a refused-connection log line.
+	body := `connect() failed (111: Connection refused) while connecting to upstream`
+	statusErr := fmt.Errorf("cubeegress: DELETE /admin/v1/policies/10.0.0.1: 502 %s", body)
+	if IsConnectionRefused(statusErr) {
+		t.Fatalf("IsConnectionRefused matched a 502 response body containing 'connection refused'; " +
+			"the classifier must only inspect the transport error, never the composed message")
+	}
+
+	// A *PermanentError with a refused-looking body must also be safe.
+	permErr := &PermanentError{Status: 502, Body: body}
+	if IsConnectionRefused(permErr) {
+		t.Fatalf("IsConnectionRefused matched a PermanentError body; the classifier must not inspect response bodies")
 	}
 }
